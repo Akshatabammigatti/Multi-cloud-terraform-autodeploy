@@ -1,0 +1,28 @@
+                  ┌─────────────────────────────┐
+                  │         Terraform            │
+                  │    (Single Command Apply)    │
+                  └──────────────┬───────────────┘
+                                 │
+     ┌───────────────────────────┼───────────────────────────┐
+     │                           │                           │
+     ▼                           ▼                           ▼
+┌──────────┐              ┌────────────┐              ┌────────────────┐
+│ AWS VPC  │              │ GCP VPC     │             │    Local PC     │
+│ Subnet   │              │ Subnet      │             │  dnsmasq + DB   │
+└────┬─────┘              └─────┬──────┘             └──────┬──────────┘
+     │                          │                            │
+     ▼                          ▼                            ▼
+┌──────────────┐         ┌──────────────┐             ┌──────────────────┐
+│ EC2 Instance  │         │ GCE Instance │             │ Health Checker    │
+│ NGINX         │         │ NGINX        │             │ (Python Script)   │
+└─────┬─────────┘         └──────┬──────┘             └────────┬─────────┘
+      │                            │                            │
+      ▼                            ▼                            ▼
+   ┌───────┐                   ┌────────┐                   ┌────────────┐
+   │Health │                   │Health  │                   │SQLite DB   │
+   │Check  │                   │Check   │                   │Status Store│
+   └───────┘                   └────────┘                   └────────────┘
+
+                       Local DNS Routing Layer
+                              (dnsmasq)
+                 AWS → Primary │ GCP → Secondary
