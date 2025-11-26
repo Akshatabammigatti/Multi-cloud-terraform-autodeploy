@@ -1,0 +1,285 @@
+multicloud-terraform/ lyaout
+├── main.tf
+├── variables.tf
+├── outputs.tf
+├── provider.tf
+├── README.md
+├── modules/
+│   ├── aws/
+│   │   └── main.tf
+│   └── gcp/
+│       └── main.tf
+└── scripts/
+    ├── dns_config.sh
+    └── healthcheck.py
+
+# aws configure (interactive)
+export AWS_ACCESS_KEY_ID="YOUR_AWS_KEY"
+export AWS_SECRET_ACCESS_KEY="YOUR_AWS_SECRET"
+export AWS_DEFAULT_REGION="us-east-1"
+# GCP
+export GOOGLE_APPLICATION_CREDENTIALS="$PWD/gcp-key.json"
+main.tf
+terraform {
+  required_version = ">= 1.0.0"
+  required_providers {
+    aws = { source = "hashicorp/aws" }
+    google = { source = "hashicorp/google" }
+    random = { source = "hashicorp/random" }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+provider "google" {
+  project = var.gcp_project
+  region  = var.gcp_region
+}
+
+resource "random_id" "suffix" {
+  byte_length = 2
+}
+
+module "aws_site" {
+  source        = "./modules/aws"
+  instance_name = "aws-nginx-${random_id.suffix.hex}"
+}
+
+module "gcp_site" {
+  source        = "./modules/gcp"
+  instance_name = "gcp-nginx-${random_id.suffix.hex}"
+}
+
+output "aws_public_ip" { value = module.aws_site.public_ip }
+output "gcp_public_ip" { value = module.gcp_site.public_ip }
+
+variables.tf
+variable "aws_region" { type = string; default = "us-east-1" }
+variable "gcp_region" { type = string; default = "us-central1" }
+variable "gcp_project" { type = string }
+variable "instance_image" { type = string; default = "debian-cloud/debian-11" }
+
+outputs.tf
+output "aws_public_ip" {
+  description = "Public IP of AWS EC2 instance"
+  value       = module.aws_site.public_ip
+}
+
+output "gcp_public_ip" {
+  description = "Public IP of GCP VM"
+  value       = module.gcp_site.public_ip
+}
+
+provider.tf
+# Ensure AWS and GCP credentials are set in environment or shared config.
+
+modules/aws/main.tf
+variable "instance_name" { type = string }
+
+data "aws_ami" "debian" {
+  most_recent = true
+  owners      = ["136693071363","099720109477","679593333241"]
+  filter { name = "name"; values = ["debian-11-amd64-*"] }
+}
+
+resource "aws_instance" "nginx" {
+  ami           = data.aws_ami.debian.id
+  instance_type = "t2.micro"
+  tags = { Name = var.instance_name }
+
+  vpc_security_group_ids = [aws_security_group.http.id]
+
+  user_data = <<-EOF
+    #!/bin/bash
+    apt-get update -y
+    apt-get install -y nginx
+    echo "AWS Cloud Online" > /var/www/html/health.html
+    systemctl enable nginx
+    systemctl restart nginx
+  EOF
+}
+
+resource "aws_security_group" "http" {
+  name        = "${var.instance_name}-sg"
+  description = "Allow HTTP"
+  ingress { from_port = 80; to_port = 80; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+  egress  { from_port = 0; to_port = 0; protocol = "-1"; cidr_blocks = ["0.0.0.0/0"] }
+}
+
+output "public_ip" { value = aws_instance.nginx.public_ip }
+
+modules/gcp/main.tf
+variable "instance_name" { type = string }
+variable "instance_image" { type = string; default = "debian-cloud/debian-11" }
+
+resource "google_compute_instance" "nginx" {
+  name         = var.instance_name
+  machine_type = "f1-micro"
+  zone         = "${var.gcp_region}-a"
+
+  boot_disk {
+    initialize_params { image = var.instance_image }
+  }
+
+  network_interface {
+    network = "default"
+    access_config {}
+  }
+
+  metadata_startup_script = <<-EOF
+    #!/bin/bash
+    apt-get update -y
+    apt-get install -y nginx
+    echo "GCP Cloud Online" > /var/www/html/health.html
+    systemctl enable nginx
+    systemctl restart nginx
+  EOF
+}
+
+resource "google_compute_firewall" "allow_http" {
+  name    = "${var.instance_name}-fw"
+  network = "default"
+  allow { protocol = "tcp"; ports = ["80"] }
+  source_ranges = ["0.0.0.0/0"]
+}
+
+output "public_ip" {
+  value = google_compute_instance.nginx.network_interface[0].access_config[0].nat_ip
+}
+
+scripts/dns_config.sh: (chmod +x scripts/dns_config.sh)
+
+#!/usr/bin/env bash
+# Usage: sudo ./scripts/dns_config.sh <AWS_IP> <GCP_IP>
+AWS_IP=$1; GCP_IP=$2; DNS_NAME="multi-cloud.local"; CFG="/etc/dnsmasq.d/multicloud.conf"
+if [ -z "$AWS_IP" ] || [ -z "$GCP_IP" ]; then
+  echo "Usage: sudo $0 <AWS_IP> <GCP_IP>"
+  exit 1
+fi
+# Default route to AWS
+echo "address=/$DNS_NAME/$AWS_IP" > $CFG
+systemctl restart dnsmasq || ( echo "Restart dnsmasq failed. If using macOS, configure /etc/hosts instead." )
+echo "Configured $DNS_NAME -> $AWS_IP (primary). Secondary: $GCP_IP"
+
+scripts/healthcheck.py   (chmod +x scripts/healthcheck.py)
+#!/usr/bin/env python3
+import os, time, sqlite3, requests, subprocess, sys
+AWS = os.getenv("AWS_IP")
+GCP = os.getenv("GCP_IP")
+DNS = os.getenv("DNS_NAME","multi-cloud.local")
+DB = os.path.join(os.path.dirname(__file__), "..", "health.db")
+
+def check(url):
+    try:
+        r = requests.get(url, timeout=3)
+        return r.status_code == 200 and "Cloud Online" in r.text
+    except:
+        return False
+
+def write_db(a,g):
+    conn = sqlite3.connect(DB); cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS health (cloud TEXT, status TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("INSERT INTO health (cloud, status) VALUES (?,?)", ("AWS", "UP" if a else "DOWN"))
+    cur.execute("INSERT INTO health (cloud, status) VALUES (?,?)", ("GCP", "UP" if g else "DOWN"))
+    conn.commit(); conn.close()
+
+def update_dns(ip):
+    cfg = f"address=/{DNS}/{ip}\\n"
+    cfg_path = '/etc/dnsmasq.d/multicloud.conf'
+    try:
+        with open(cfg_path,'w') as f: f.write(cfg)
+        subprocess.run(['systemctl','restart','dnsmasq'], check=True)
+    except Exception as e:
+        print("DNS update failed (needs sudo):", e)
+
+if __name__ == "__main__":
+    if not AWS or not GCP:
+        print("Set AWS_IP and GCP_IP env variables and run again.")
+        sys.exit(1)
+    while True:
+        aws_ok = check(f"http://{AWS}/health.html")
+        gcp_ok = check(f"http://{GCP}/health.html")
+        write_db(aws_ok, gcp_ok)
+        if aws_ok:
+            update_dns(AWS)
+            print("Routing -> AWS")
+        else:
+            update_dns(GCP)
+            print("Routing -> GCP")
+        time.sleep(5)
+
+
+commands used in this project at each step sequentially:
+1. Clone repo
+
+git clone https://github.com/YOUR_USERNAME/multicloud-terraform.git
+cd multicloud-terraform
+
+2. Set credentials
+
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_DEFAULT_REGION="us-east-1"
+export GOOGLE_APPLICATION_CREDENTIALS="$PWD/gcp-key.json"
+
+(Place gcp-key.json in repo root or update path.)
+
+3. Initialise Terraform
+
+terraform init
+
+4. Format & validate
+
+terraform fmt
+terraform validate
+
+5. Check the plan for resources and cost warnings.
+
+Apply (single command deploys both clouds)
+
+terraform apply -var="gcp_project=MY_PROJECT_ID" -auto-approve
+
+6. Store outputs to env
+
+export AWS_IP=$(terraform output -raw aws_public_ip)
+export GCP_IP=$(terraform output -raw gcp_public_ip)
+echo "AWS_IP=$AWS_IP, GCP_IP=$GCP_IP"
+
+7. Configure local DNS (must be sudo)
+
+sudo ./scripts/dns_config.sh $AWS_IP $GCP_IP
+
+8. Start health checker (requires sudo for dns update)
+
+AWS_IP=$AWS_IP GCP_IP=$GCP_IP sudo -E python3 scripts/healthcheck.py
+
+9. Test via curl
+
+curl http://$AWS_IP/health.html
+curl http://$GCP_IP/health.html
+curl http://multi-cloud.local/health.html
+
+10. Simulate failure (demo)
+SSH to AWS instance and stop NGINX:
+
+ssh ubuntu@$AWS_IP         
+sudo systemctl stop nginx
+# or ec2-user depending on AMI
+# leave the healthchecker running — it should switch DNS to GCP
+Check curl http://multi-cloud.local/health.html 
+
+11. Cleanup
+terraform destroy -var="gcp_project=MY_PROJECT_ID" -auto-approve
+Always destroy to avoid additional charges.
+
+
+
+
+
+
+
+
+
+
